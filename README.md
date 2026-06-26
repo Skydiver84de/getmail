@@ -1,115 +1,65 @@
-# Getmail
+# getmail (mailcow / MailPiler)
 
-Getmail is a small Python script to retrieve emails from IMAP accounts (e.g. gmx.de, gmail.com) and deliver these emails to the Mailcow/Dovecot mailbox. 
-I wrote to Getmail because I couldn't find any other solution with IMAP-IDLE in 2018 https://github.com/mailcow/mailcow-dockerized/issues/1554. 
-Emails are retrieved using IMAP IDLE, so emails are retrieved immediately and not after a fixed interval (as with imapsync from Mailcow). 
-The transfer to Mailcow is done via [LMTP interface (simplified SNMP) from Dovecot](https://doc.dovecot.org/configuration_manual/howto/postfix_dovecot_lmtp/), 
-so you can also use the [sieve rules from Dovecoat](https://doc.dovecot.org/configuration_manual/sieve/examples/) (imapsync from Mailcow only allows a fixed folder). The goal of Getmail is to empty the entire INBOX. If the source IMAP account contains emails, 
-you should copy/move them to another folder for testing (e.g. with an email programm or webmail).  
+Retrieve mail from IMAP accounts via **IMAP IDLE** (instant push, not polled) and deliver
+it into a local **Mailcow** mailbox (Dovecot LMTP) or a **MailPiler** archive (SMTP). Runs
+as a Docker sidecar inside the Mailcow network. This fork adds **reconnect hardening** so a
+dropped link (e.g. lost Wi-Fi) is detected and recovered automatically.
 
-Install:
--  Clone getmail
-   ```
-   cd /opt
-   git clone https://github.com/mkrumbholz/getmail.git
-   cd /opt/getmail
-   ```
-- Copy the docker-compose.override.yml file to the mailcow-dockerized folder. Please check if there is already a docker-compose.override.yml in the mailcow directory!!
-   ```
-   cp /opt/getmail/mailcow-dockerized_docker-compose.override.yml /opt/mailcow-dockerized/docker-compose.override.yml
-   ```
-- Config file must be customized
-  ```
-   cp /opt/getmail/conf/settings.ini.example  /opt/getmail/conf/settings.ini
-   vi /opt/getmail/conf/settings.ini
-  ```
-- Start mailcow and getmail.
-  ```
-   cd /opt/getmail
-   docker compose build 
-   cd /opt/mailcow-dockerized
-   docker compose  up -d
-  ```
- - Now check the logs from getmail
-   ```
-   docker compose logs getmail-mailcow
-   ```
+## What it does
 
+- Watches one IMAP folder per account with IDLE → new mail is fetched immediately.
+- Delivers via Dovecot **LMTP** (Sieve rules apply) or **SMTP** to MailPiler.
+- Empties the source folder (delete) or moves fetched mail to a folder there.
+- Optional **ClamAV** scan before delivery (LMTP bypasses Mailcow's own scanner).
+- Adds `X-getmail-retrieved-from-mailbox-*` headers for Sieve filtering.
 
+## Install
 
-
-# Config
-
-Getmail is configured with the configuration file .getmail/conf/settings.ini. Everything under [DEFAULT] applies to all IMAP accounts. Mostly only imap_hostname:, imap_username:, imap_password: have to be customized. In the source IMAP account only one folder is monitored (default = imap_sync_folder: INBOX), if the junk folder should also be monitored, two accounts must be created. 
-
- ```
-[INBOX_test_gmx.de]
-imap_hostname:     imap.gmx.net
-imap_username:     test@gmx.de
-imap_password:     xxx
-# INFO: "imap_sync_folder: INBOX" is default
-[JUNK_test_gmx.de]
-imap_hostname:     imap.gmx.net
-imap_username:     test@gmx.de
-imap_password:     xxx
-imap_sync_folder:  Junk
+```bash
+cd /opt
+git clone https://github.com/Skydiver84de/getmail.git
+cd /opt/getmail
+# check for an existing override file first!
+cp mailcow-dockerized_docker-compose.override.yml /opt/mailcow-dockerized/docker-compose.override.yml
+cp conf/settings.ini.example conf/settings.ini
+nano conf/settings.ini
+cd /opt/mailcow-dockerized && docker compose up -d
+docker compose logs -f getmail-mailcow
 ```
 
-Normally retrieved emails are deleted from the source IMAP account (imap_move_enable: False), the goal of the script is to completely empty the monitored folder (e.g. INBOX). 
-It is also possible to move the emails to a folder in the IMAP source account; the emails are then available in both the IMAP source account and the IMAP target account. 
-```
-imap_move_enable: True
-imap_move_folder: getmail
-# "getmail" "getmail" is an existing folder in the IMAP source account
-```
+## Configuration
 
-With 'lmtp_recipient:' you specify the destination imap account in mailcow. 
+`conf/settings.ini` — `[DEFAULT]` applies to all accounts; each `[section]` is one IMAP
+account (usually only host/user/password/recipient differ):
 
-
-
-Sieve filter:
-In every retrieved email, two header (X-getmail-retrieved-from-mailbox-user, X-getmail-retrieved-from-mailbox-folder) are added, with this information you can filter with sieve (Mailcow: Mail Setup -> Filters -> Add Filter)
-
-Example:
-```
-require "fileinto";
-require "regex";
-require "body";
-...
-if header :contains ["X-getmail-retrieved-from-mailbox-user"] ["xxxtestxxx@gmx.de", "xxxtest2xxxx@gmx.de"]
-{
-    fileinto "INBOX/Getmail_GMX";
-}
-elsif header :contains ["X-getmail-retrieved-from-mailbox-user"] ["xxxtestxxx@outlook.de", "xxxtest2xxxx@outlook.de"]
-{
-    fileinto "INBOX/Getmail_Outlook";
-}
-else
-{
-  # The rest goes into INBOX
-  # default is "implicit keep", we do it explicitly here
-  keep;
-}
+```ini
+[example@gmx.de]
+imap_hostname:   imap.gmx.net
+imap_username:   example@gmx.de
+imap_password:   xxx
+lmtp_recipient:  me@my-mailcow-domain.tld   # target mailbox in Mailcow
+# imap_sync_folder defaults to INBOX; one folder per account (add a 2nd section for Junk)
 ```
 
+Key options:
 
+| Option | Default | Meaning |
+|---|---|---|
+| `send_protocol` | `lmtp` | `lmtp` → Mailcow/Dovecot, `smtp` → MailPiler archive |
+| `imap_move_enable` | `False` | `True` = move to `imap_move_folder` instead of deleting from the source |
+| `clamd_active` | `False` | scan via ClamAV before delivery |
 
-TZ variable:
+**Reconnect hardening** (optional, sensible defaults): TCP keepalive, a socket-timeout
+backstop and a capped exponential backoff — a dead link is detected in ~2 min and recovers
+in seconds. Individual knobs are documented in
+[`conf/settings.ini.example`](conf/settings.ini.example).
 
-The TZ vairable defines the time zone. I have defined the variable in the file /etc/default/locale (reboot may be necessary afterwards)
+**Timezone:** set `TZ` (e.g. `TZ=Europe/Berlin`) in the environment or `docker-compose.yml`.
 
-```
-# cat /etc/default/locale
-LANG="en_US.UTF-8"
-LANGUAGE="en_US:en"
-TZ="Europe/Berlin"
-```
+**Sieve:** filter on the injected `X-getmail-retrieved-from-mailbox-user` header
+(Mailcow → Mail Setup → Filters).
 
-Alternatively, you can replace TZ=${TZ} with TZ="Europe/Berlin" in the docker-compose.yml. 
+## Credits
 
-If the TZ variable is not defined, the following error message appears when starting getmail:
-"WARNING: The TZ variable is not set. Defaulting to a blank string."
-
-# Credits  
-
-- https://github.com/christianbur/getmail (original author)
+- [christianbur/getmail](https://github.com/christianbur/getmail) — original author
+- [mkrumbholz/getmail](https://github.com/mkrumbholz/getmail) — IMAP-IDLE robustness, SMTP/MailPiler delivery, ClamAV scanning (base of this fork)

@@ -14,6 +14,7 @@ import logging
 import sys
 import socket
 import struct
+import random
 
 import imapclient
 import configparser
@@ -73,6 +74,23 @@ class Getmail(threading.Thread):
         # on the server and is only delivered late). 0 disables it (pure IDLE behaviour).
         self.imap_periodic_fetch_interval = configparser_file.getint(config_name, 'imap_periodic_fetch_interval', fallback=60)
 
+        # Reconnect hardening: detect a dead link (e.g. lost Wi-Fi) quickly instead
+        # of silently sitting in a half-open connection.
+        # - socket timeout: backstop so no blocking call (login/fetch/idle_done) can
+        #   hang forever; 0 keeps the previous (blocking) behaviour.
+        # - TCP keepalive: the kernel actively probes the peer during IDLE silence,
+        #   which is the only thing that notices a blackholed link while idling.
+        self.imap_socket_timeout  = configparser_file.getint(config_name, 'imap_socket_timeout', fallback=60)
+        self.imap_keepalive       = configparser_file.getboolean(config_name, 'imap_keepalive', fallback=True)
+        self.imap_keepalive_idle  = configparser_file.getint(config_name, 'imap_keepalive_idle', fallback=60)
+        self.imap_keepalive_intvl = configparser_file.getint(config_name, 'imap_keepalive_intvl', fallback=15)
+        self.imap_keepalive_cnt   = configparser_file.getint(config_name, 'imap_keepalive_cnt', fallback=4)
+        # Capped exponential backoff with jitter for the restart loop, so a flapping
+        # link recovers in seconds instead of getting stuck in the old quadratic,
+        # uncapped wait (60 * counter**2 -> minutes/hours).
+        self.reconnect_backoff_base = configparser_file.getint(config_name, 'reconnect_backoff_base', fallback=5)
+        self.reconnect_backoff_max  = configparser_file.getint(config_name, 'reconnect_backoff_max', fallback=300)
+
         self.send_protocol        = configparser_file.get(       config_name, 'send_protocol', fallback="lmtp")
 
         self.lmtp_hostname        = configparser_file.get(       config_name, 'lmtp_hostname', fallback="localhost")
@@ -86,7 +104,7 @@ class Getmail(threading.Thread):
         self.smtp_debug           = configparser_file.getboolean(config_name, 'smtp_debug', fallback=False)
 
         self.clamd_active         = configparser_file.getboolean(config_name, 'clamd_active', fallback=False)
-        self.clamd_hostname       = configparser_file.get(       config_name, 'clamd_hostname', fallback="clamd")
+        self.clamd_hostname       = configparser_file.get(       config_name, 'clamd_hostname', fallback="clamd-mailcow")
         self.clamd_port           = configparser_file.getint(    config_name, 'clamd_port', fallback=3310)
         self.clamd_max_chunk_size = humanfriendly.parse_size(configparser_file.get(config_name, 'clamd_max_chunk_size', fallback="10MB"), binary=True) # MUST be < StreamMaxLength in /etc/clamav/clamd.conf
 
@@ -98,15 +116,22 @@ class Getmail(threading.Thread):
           except ImapReconnect as e:
             # Routine server-side IDLE timeout etc. -> reconnect right away, no penalty.
             logging.info("%s" % (e))
+            self.safe_close()
             continue
           except Exception as e:
             logging.error("%s" % (e))
             #traceback.print_exc()
+            self.safe_close()
 
           if not self.exit_imap_idle_loop:
             self.exception_counter += 1
-            logging.error("restart thread in %s minutes (counter: %d)" % (self.exception_counter * self.exception_counter, self.exception_counter))
-            self.event.wait(60 * self.exception_counter * self.exception_counter )
+            # Capped exponential backoff with jitter (was: uncapped 60 * counter**2).
+            # The exponent is clamped so a permanently-down server can't blow up 2**counter.
+            exp = min(self.exception_counter - 1, 16)
+            delay = min(self.reconnect_backoff_base * (2 ** exp), self.reconnect_backoff_max)
+            delay += random.uniform(0, delay * 0.25)
+            logging.error("restart thread in %.0f seconds (counter: %d)" % (delay, self.exception_counter))
+            self.event.wait(delay)
 
     def imap_idle_stop(self):
         logging.info("IMAP_IDLE_STOP")
@@ -116,7 +141,14 @@ class Getmail(threading.Thread):
     def imap_start_connection(self):
         logging.info("Start Getmail - server: %s:%s, username: %s, ssl: %s" % (self.imap_hostname, self.imap_port, self.imap_username, self.imap_ssl))
 
-        self.imap = imapclient.IMAPClient(self.imap_hostname, port=self.imap_port, ssl=self.imap_ssl, use_uid=True)
+        socket_timeout = self.imap_socket_timeout if self.imap_socket_timeout > 0 else None
+        self.imap = imapclient.IMAPClient(self.imap_hostname, port=self.imap_port, ssl=self.imap_ssl, use_uid=True, timeout=socket_timeout)
+        self.enable_tcp_keepalive()
+        # Re-apply timeout on the (possibly SSL-wrapped) socket so idle_check()
+        # cannot block forever on a dead link — the IMAPClient constructor sets it
+        # on the raw socket before the SSL handshake, which may not carry through.
+        if socket_timeout:
+            self.imap.socket().settimeout(socket_timeout)
         login_status = self.imap.login(self.imap_username, self.imap_password).decode("utf-8")
         logging.info("Login - status: %s" % login_status)
 
@@ -139,11 +171,42 @@ class Getmail(threading.Thread):
 
         self.exception_counter = 0
 
+    def enable_tcp_keepalive(self):
+        # Turn on TCP keepalive so the kernel actively notices a dead peer during IDLE
+        # silence - a lost link otherwise looks exactly like a quiet-but-alive server to
+        # idle_check() and the connection stays half-open until the OS TCP timeout (~15 min).
+        if not self.imap_keepalive:
+            return
+        try:
+            sock = self.imap.socket()
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Platform-specific tuning (Linux/Alpine container); skipped where unsupported.
+            for opt_name, value in (("TCP_KEEPIDLE", self.imap_keepalive_idle),
+                                    ("TCP_KEEPINTVL", self.imap_keepalive_intvl),
+                                    ("TCP_KEEPCNT", self.imap_keepalive_cnt)):
+                opt = getattr(socket, opt_name, None)
+                if opt is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except Exception as e:
+            logging.warning("Could not enable TCP keepalive on IMAP socket: %s" % e)
 
     def imap_close_connection(self):
         if self.imap != None:
           status_logout = self.imap.logout()
           #logging.info("Close IMAP connection - status_logout: %s" % (status_logout))
+
+    def safe_close(self):
+        # Best-effort teardown of a possibly-dead connection before reconnecting, so we
+        # don't leak a socket/FD on every reconnect (frequent on a flapping link). Uses
+        # shutdown() (no LOGOUT round-trip) because the peer may already be gone.
+        if self.imap is None:
+            return
+        try:
+            self.imap.shutdown()
+        except Exception:
+            pass
+        finally:
+            self.imap = None
 
     def imap_idle(self):
         self.imap_start_connection()

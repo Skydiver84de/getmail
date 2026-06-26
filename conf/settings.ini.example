@@ -9,6 +9,21 @@ imap_move_folder:  getmail
 imap_sync_folder:  INBOX
 imap_ssl:          True
 
+#Reconnect hardening (all optional, shown with their defaults).
+#Detects a dead link (e.g. lost Wi-Fi) quickly instead of sitting in a half-open
+#connection until the OS TCP timeout (~15 min).
+#imap_socket_timeout:     60      # seconds; backstop for blocking calls, 0 = old blocking behaviour
+#imap_keepalive:          True    # TCP keepalive so the kernel probes the peer during IDLE silence
+#imap_keepalive_idle:     60      # seconds idle before the first keepalive probe (Linux)
+#imap_keepalive_intvl:    15      # seconds between probes (Linux)
+#imap_keepalive_cnt:      4       # failed probes before the link counts as dead (Linux)
+#reconnect_backoff_base:  5       # seconds; first restart delay, doubles each failure
+#reconnect_backoff_max:   300     # seconds; cap for the restart delay
+
+#Safety net: force a full fetch every N seconds even without an IDLE notification.
+#0 disables it (pure IDLE behaviour).
+#imap_periodic_fetch_interval: 60
+
 #Only one is active: "lmtp" or "smtp"
 send_protocol:     lmtp
 
@@ -22,7 +37,10 @@ smtp_port:         25
 smtp_debug:        False
 smtp_recipient:    CHANGE-ME@YOUR-MAILCOW-MAILBOX-ADDRESS.EXAMPLE
 
-clamd_hostname:    clamd
+#clamd_hostname for Mailcow (ClamAV in the mailcow-network):
+clamd_hostname:    clamd-mailcow
+#clamd_hostname for standalone (own clamd container from docker-compose.yml):
+#clamd_hostname:   clamd
 clamd_port:        3310
 clamd_active:      False
 clamd_max_chunk_size: 10MB
